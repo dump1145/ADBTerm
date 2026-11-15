@@ -1,0 +1,83 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize layout
+        run: |
+          mkdir -p Sources
+          shopt -s nullglob
+          for f in *.swift; do mv "$f" "Sources/"; done
+          ls -la Sources
+
+      - name: Write project.yml
+        run: |
+          cat > project.yml <<'YAML'
+          name: ADBTerm
+          options:
+            bundleIdPrefix: com.example
+            deploymentTarget:
+              iOS: "16.0"
+          targets:
+            ADBTerm:
+              type: application
+              platform: iOS
+              sources:
+                - Sources
+              info:
+                path: Info.plist
+                properties:
+                  CFBundleDisplayName: ADBTerm
+                  UILaunchScreen: {}
+                  NSLocalNetworkUsageDescription: 需要访问局域网以连接 Android 设备的 ADB。
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.adbterm
+                  SWIFT_VERSION: "5.0"
+                  MARKETING_VERSION: "0.1"
+                  CURRENT_PROJECT_VERSION: "1"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+          YAML
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project ADBTerm.xcodeproj -target ADBTerm \
+            -configuration Release -sdk iphoneos \
+            SYMROOT="$PWD/build" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Release-iphoneos/ADBTerm.app Payload/
+          zip -qr ADBTerm.ipa Payload
+          unzip -l ADBTerm.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ADBTerm-ipa
+          path: ADBTerm.ipa
