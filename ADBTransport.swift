@@ -9,18 +9,27 @@ enum ADB {
     static let WRTE: UInt32 = 0x45545257
     static let CLSE: UInt32 = 0x45534c43
     static let STLS: UInt32 = 0x534c5453
+
+    /// 协议版本：0x01000001 = A_VERSION_SKIP_CHECKSUM? 保持 host 最低版本即可被设备接受
+    static let version: UInt32 = 0x0100_0000
+    /// 单个包的负载上限（设备会在 CNXN 的 arg1 里给 maxdata）
+    static let maxPayload = 256 * 1024
 }
 
 enum ADBError: Error, LocalizedError {
-    case closed, badMessage, tlsRequired
+    case closed, badMessage, tlsRequired, timeout, streamClosed
     var errorDescription: String? {
         switch self {
         case .closed:
             return "连接已关闭"
         case .badMessage:
             return "收到异常的 ADB 数据"
+        case .timeout:
+            return "等待设备响应超时"
+        case .streamClosed:
+            return "数据流已关闭"
         case .tlsRequired:
-            return "设备要求 TLS（Android 11+ 的无线调试端口）。v1 只支持明文 ADB：请先用电脑执行 adb tcpip 5555，再连接 5555 端口。"
+            return "设备要求 TLS（Android 11+ 的无线调试端口）。本版只支持明文 ADB：请先用电脑执行 adb tcpip 5555，再连接 5555 端口。"
         }
     }
 }
@@ -53,12 +62,22 @@ extension Data {
 /// 基于 Network.framework 的 TCP 传输 + ADB 消息收发。
 final class ADBTransport: @unchecked Sendable {
     private let conn: NWConnection
+    /// 预读缓冲：一次 receive 尽量多拿，避免每个 24 字节头都等一次系统回调。
+    private var pending = Data()
+    private let queue = DispatchQueue(label: "adb.transport")
 
     init(host: String, port: UInt16) {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true          // 关 Nagle，交互式 shell 的按键立刻下发
+        tcp.enableKeepalive = true  // 空闲链路保活，避免路由器回收 NAT 表项
+        tcp.keepaliveIdle = 10
+        tcp.connectionTimeout = 8
+        let params = NWParameters(tls: nil, tcp: tcp)
+        params.serviceClass = .responsiveData
         conn = NWConnection(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: port) ?? 5555,
-            using: .tcp
+            using: params
         )
     }
 
@@ -81,7 +100,7 @@ final class ADBTransport: @unchecked Sendable {
                     break
                 }
             }
-            conn.start(queue: DispatchQueue(label: "adb.transport"))
+            conn.start(queue: queue)
         }
     }
 
@@ -95,12 +114,11 @@ final class ADBTransport: @unchecked Sendable {
         }
     }
 
+    /// 缓冲读取：先把 pending 里的数据交出去，不够再向系统要，且每次尽量多要。
     private func receive(exactly n: Int) async throws -> Data {
-        var buf = Data()
-        while buf.count < n {
-            let remaining = n - buf.count
+        while pending.count < n {
             let chunk: Data = try await withCheckedThrowingContinuation { cont in
-                conn.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, isComplete, error in
+                conn.receive(minimumIncompleteLength: 1, maximumLength: max(n - pending.count, 64 * 1024)) { data, _, isComplete, error in
                     if let error = error {
                         cont.resume(throwing: error)
                     } else if let data = data, !data.isEmpty {
@@ -112,9 +130,16 @@ final class ADBTransport: @unchecked Sendable {
                     }
                 }
             }
-            buf.append(chunk)
+            if chunk.isEmpty {
+                // 空回调说明本次没有数据，让出一次避免空转
+                try await Task.sleep(nanoseconds: 5_000_000)
+                continue
+            }
+            pending.append(chunk)
         }
-        return buf
+        let out = Data(pending.prefix(n))
+        pending.removeFirst(n)
+        return out
     }
 
     func sendMessage(_ cmd: UInt32, _ arg0: UInt32, _ arg1: UInt32, _ payload: Data = Data()) async throws {

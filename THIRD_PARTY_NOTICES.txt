@@ -1,0 +1,10 @@
+ADBTerm 在编译时会下载并打包 scrcpy 的服务端程序（scrcpy-server）。
+
+scrcpy
+Copyright (C) 2018 Genymobile
+Copyright (C) 2018-2026 Romain Vimont
+Licensed under the Apache License, Version 2.0
+https://github.com/Genymobile/scrcpy
+License text: https://www.apache.org/licenses/LICENSE-2.0
+
+scrcpy-server 以未修改的形式推送到被控设备并在设备上运行。
