@@ -14,12 +14,9 @@ final class ADBStream {
     var onData: ((Data) -> Void)?
     var onClose: (() -> Void)?
     private(set) var closed = false
-    /// 已经收到但还没被取走的 OKAY 许可（多写者共用，避免重复等待）
-    private var okayCredit = 0
-    private var okayWaiters: [CheckedContinuation<Void, Never>] = []
+    private var okayCount = 0
+    private var okayWaiter: CheckedContinuation<Void, Never>?
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
-    /// 同时在途的最大分包数：设备对每个 WRTE 回一个 OKAY，多包并流能显著提升传输速度
-    let window = 4
 
     init(id: UInt32, transport: ADBTransport, maxData: Int) {
         self.id = id
@@ -28,27 +25,27 @@ final class ADBStream {
     }
 
     func awaitOkay() async {
-        if okayCredit > 0 { okayCredit -= 1; return }
+        if okayCount > 0 { okayCount -= 1; return }
         if closed { return }
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            okayWaiters.append(c)
+            okayWaiter = c
         }
     }
 
     func gotOkay() {
-        if !okayWaiters.isEmpty {
-            okayWaiters.removeFirst().resume()
+        if let w = okayWaiter {
+            okayWaiter = nil
+            w.resume()
         } else {
-            okayCredit += 1
+            okayCount += 1
         }
     }
 
     func markClosed() {
         guard !closed else { return }
         closed = true
-        let ks = okayWaiters
-        okayWaiters = []
-        ks.forEach { $0.resume() }
+        okayWaiter?.resume()
+        okayWaiter = nil
         let ws = closeWaiters
         closeWaiters = []
         ws.forEach { $0.resume() }
@@ -62,23 +59,14 @@ final class ADBStream {
         }
     }
 
-    /// 按设备 maxdata 分片发送；最多 window 个包在途，发完统一收尾等待确认。
+    /// 按设备 maxdata 分片发送，每片等待对端 OKAY（流控）。
     func write(_ data: Data) async {
         var off = 0
-        var inflight = 0
         while off < data.count && !closed {
-            while inflight >= window && !closed {
-                await awaitOkay()
-                inflight -= 1
-            }
             let end = min(off + maxData, data.count)
             try? await transport.sendMessage(ADB.WRTE, id, remoteId, Data(data[off..<end]))
-            off = end
-            inflight += 1
-        }
-        while inflight > 0 && !closed {
             await awaitOkay()
-            inflight -= 1
+            off = end
         }
     }
 
@@ -110,12 +98,6 @@ final class ADBClient: ObservableObject {
     private var shell: ADBStream?
     private var logStream: ADBStream?
 
-    /// 自动重连：记住上一次成功/尝试的地址，断线后按 1s / 2s / 4s 退避重试三次
-    private var lastHost = ""
-    private var lastPort: UInt16 = 0
-    private var reconnectCount = 0
-    var autoReconnect = true
-
     // MARK: - 连接
 
     func connect(host: String, port: String) {
@@ -123,9 +105,6 @@ final class ADBClient: ObservableObject {
             status = "请填写正确的 IP 和端口"
             return
         }
-        lastHost = host
-        lastPort = p
-        reconnectCount = 0
         disconnect()
         status = "连接中…"
         connectTask = Task { await self.run(host: host, port: p) }
@@ -161,7 +140,6 @@ final class ADBClient: ObservableObject {
             try await t.sendMessage(ADB.CNXN, 0x0100_0000, 256 * 1024, Data("host::ADBTerm\0".utf8))
 
             var sentSignature = false
-            var sentPublicKey = false
             var banner = ""
             var maxData = 4096
             handshake: while true {
@@ -173,17 +151,12 @@ final class ADBClient: ObservableObject {
                     break handshake
                 case ADB.AUTH where m.arg0 == 1:
                     if !sentSignature {
-                        // 第一轮：用本机 RSA 私钥对 token 签名
                         let sig = try key.sign(token: m.data)
                         try await t.sendMessage(ADB.AUTH, 2, 0, sig)
                         sentSignature = true
-                    } else if !sentPublicKey {
-                        // 第二轮：设备不认识这个 key，把公钥送过去等用户点“允许”
-                        try await t.sendMessage(ADB.AUTH, 3, 0, key.publicKeyPayload)
-                        sentPublicKey = true
-                        status = "请在手机上点“允许 USB 调试”（勾选“始终允许”）"
                     } else {
-                        throw ADBError.closed
+                        status = "请在手机上点“允许 USB 调试”"
+                        try await t.sendMessage(ADB.AUTH, 3, 0, key.publicKeyPayload)
                     }
                 case ADB.STLS:
                     throw ADBError.tlsRequired
@@ -194,7 +167,6 @@ final class ADBClient: ObservableObject {
 
             deviceMaxData = max(1024, min(maxData, 64 * 1024))
             connected = true
-            reconnectCount = 0
             status = "已连接 \(host):\(port)"
             append("[已连接] \(banner.prefix(120))\n")
 
@@ -215,7 +187,6 @@ final class ADBClient: ObservableObject {
             }
             t.cancel()
             connected = false
-            scheduleReconnect()
         }
     }
 
@@ -223,11 +194,8 @@ final class ADBClient: ObservableObject {
         guard let s = streams[m.arg1] else { return }
         switch m.command {
         case ADB.OKAY:
-            if s.remoteId == 0 {
-                s.remoteId = m.arg0      // OPEN 的答复，带回设备侧 id
-            } else {
-                s.gotOkay()              // WRTE 的流控确认
-            }
+            if s.remoteId == 0 { s.remoteId = m.arg0 }
+            s.gotOkay()
         case ADB.WRTE:
             if s.remoteId == 0 { s.remoteId = m.arg0 }
             s.onData?(m.data)
@@ -246,21 +214,6 @@ final class ADBClient: ObservableObject {
         logRunning = false
         closeAllStreams()
         status = "连接断开：\(error.localizedDescription)"
-        scheduleReconnect()
-    }
-
-    /// 断线后按 1s / 2s / 4s 退避重连，最多三次；手动 disconnect 不会触发。
-    private func scheduleReconnect() {
-        guard autoReconnect, !lastHost.isEmpty, reconnectCount < 3 else { return }
-        reconnectCount += 1
-        let attempt = reconnectCount
-        let delay = UInt64(1 << (attempt - 1)) * 1_000_000_000
-        status = "连接断开，\(attempt)/3 次重连中…"
-        connectTask = Task {
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled, !connected else { return }
-            await run(host: lastHost, port: lastPort)
-        }
     }
 
     // MARK: - 流
@@ -279,11 +232,7 @@ final class ADBClient: ObservableObject {
             streams[s.id] = nil
             return nil
         }
-        // OPEN 超时保护：设备不回应时不能无限挂着
-        let deadline = Date().addingTimeInterval(4)
-        while s.remoteId == 0 && !s.closed && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 15_000_000)
-        }
+        await s.awaitOkay()
         if s.closed || s.remoteId == 0 {
             streams[s.id] = nil
             return nil

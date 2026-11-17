@@ -9,26 +9,8 @@ struct FilesView: View {
     @State private var shareURL: URL?
     @State private var picking = false
     @State private var deleting: FileEntry?
-    @State private var renaming: FileEntry?
-    @State private var renameText = ""
     @State private var newFolder = false
     @State private var folderName = ""
-    @AppStorage("files.showHidden") private var showHidden = false
-    @State private var sort = 0
-
-    private var shown: [FileEntry] {
-        var list = showHidden ? entries : entries.filter { !$0.name.hasPrefix(".") }
-        switch sort {
-        case 1: list.sort { $0.size > $1.size }
-        case 2: list.sort { $0.mtime > $1.mtime }
-        default:
-            list.sort {
-                if $0.isDir != $1.isDir { return $0.isDir }
-                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-            }
-        }
-        return list
-    }
 
     private let shortcuts = ["/sdcard", "/sdcard/Download", "/sdcard/DCIM", "/data/local/tmp", "/"]
 
@@ -43,16 +25,6 @@ struct FilesView: View {
                     .truncationMode(.head)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button { Task { await reload() } } label: { Image(systemName: "arrow.clockwise") }
-                Menu {
-                    Picker("排序", selection: $sort) {
-                        Text("名称").tag(0)
-                        Text("大小").tag(1)
-                        Text("时间").tag(2)
-                    }
-                    Toggle("显示隐藏文件", isOn: $showHidden)
-                } label: {
-                    Image(systemName: "line.3.horizontal.decrease.circle")
-                }
                 Button { newFolder = true } label: { Image(systemName: "folder.badge.plus") }
                 Button { picking = true } label: { Image(systemName: "square.and.arrow.up") }
             }
@@ -80,7 +52,7 @@ struct FilesView: View {
                 }
             }
 
-            List(shown) { e in
+            List(entries) { e in
                 Button { open(e) } label: {
                     HStack(spacing: 10) {
                         Image(systemName: e.isDir ? "folder.fill" : (e.isLink ? "link" : "doc"))
@@ -96,20 +68,13 @@ struct FilesView: View {
                     Button(role: .destructive) { deleting = e } label: {
                         Label("删除", systemImage: "trash")
                     }
-                    Button {
-                        renameText = e.name
-                        renaming = e
-                    } label: {
-                        Label("重命名", systemImage: "pencil")
-                    }
-                    .tint(.orange)
                 }
             }
             .listStyle(.plain)
             .overlay {
                 if loading {
                     ProgressView()
-                } else if shown.isEmpty && adb.connected {
+                } else if entries.isEmpty && adb.connected {
                     Text("空目录或无权限").foregroundColor(.secondary)
                 }
             }
@@ -132,15 +97,6 @@ struct FilesView: View {
             TextField("名称", text: $folderName)
             Button("创建") { makeFolder() }
             Button("取消", role: .cancel) { folderName = "" }
-        }
-        .alert("重命名为", isPresented: Binding(
-            get: { renaming != nil }, set: { if !$0 { renaming = nil } }
-        )) {
-            TextField("新名称", text: $renameText)
-            Button("确定") { doRename() }
-            Button("取消", role: .cancel) { renaming = nil }
-        } message: {
-            Text(renaming.map { "当前：\($0.name)" } ?? "")
         }
     }
 
@@ -208,19 +164,6 @@ struct FilesView: View {
         guard !name.isEmpty else { return }
         Task {
             _ = await adb.shellText("mkdir -p \(shq(child(name)))")
-            await reload()
-        }
-    }
-
-    private func doRename() {
-        guard let e = renaming else { return }
-        let newName = renameText.trimmingCharacters(in: .whitespaces)
-        renaming = nil
-        renameText = ""
-        guard !newName.isEmpty, newName != e.name, !newName.contains("/") else { return }
-        Task {
-            let ok = await adb.rename(child(e.name), to: child(newName))
-            message = ok ? "已重命名" : "重命名失败（可能无权限或目标已存在）"
             await reload()
         }
     }

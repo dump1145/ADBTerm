@@ -109,6 +109,8 @@ final class VideoParser {
 final class H264Renderer {
     let layer = AVSampleBufferDisplayLayer()
     private var format: CMVideoFormatDescription?
+    /// 从 SPS/PPS 解出的画面尺寸，用作 session 包缺失时的兜底。
+    private(set) var videoSize: CGSize = .zero
 
     init() {
         layer.videoGravity = .resizeAspect
@@ -118,6 +120,7 @@ final class H264Renderer {
     func flush() {
         layer.flushAndRemoveImage()
         format = nil
+        videoSize = .zero
     }
 
     static func nalUnits(_ b: [UInt8]) -> [ArraySlice<UInt8>] {
@@ -174,7 +177,13 @@ final class H264Renderer {
                 )
             }
         }
-        if status == noErr { format = fd }
+        if status == noErr, let created = fd {
+            format = created
+            let dims = CMVideoFormatDescriptionGetDimensions(created)
+            if dims.width > 0 && dims.height > 0 {
+                videoSize = CGSize(width: Int(dims.width), height: Int(dims.height))
+            }
+        }
     }
 
     func enqueue(_ annexB: Data, pts: Int64) {
@@ -233,25 +242,7 @@ final class MirrorClient: ObservableObject {
     @Published var status = "未启动"
     @Published var running = false
     @Published var videoSize = CGSize.zero
-    @Published var quality = 1 {
-        didSet { UserDefaults.standard.set(quality, forKey: "mirror.quality") }
-    }
-    /// 码率（Mbps），对应 scrcpy 的 video_bit_rate
-    @Published var bitrateMbps: Double = 4 {
-        didSet { UserDefaults.standard.set(bitrateMbps, forKey: "mirror.bitrate") }
-    }
-    /// 最大帧率，对应 max_fps
-    @Published var fps: Int = 30 {
-        didSet { UserDefaults.standard.set(fps, forKey: "mirror.fps") }
-    }
-    /// 镜像时让设备熄屏，对应 turn_screen_off（省电，画面照常推送）
-    @Published var turnScreenOff = false {
-        didSet { UserDefaults.standard.set(turnScreenOff, forKey: "mirror.offscreen") }
-    }
-    /// 画面比例：0 等比完整显示，1 铺满裁切
-    @Published var scaleMode: Int = 0 {
-        didSet { UserDefaults.standard.set(scaleMode, forKey: "mirror.scale") }
-    }
+    @Published var quality = 1
 
     let renderer = H264Renderer()
 
@@ -264,19 +255,6 @@ final class MirrorClient: ObservableObject {
     private var queue: [Data] = []
     private var draining = false
     private var gen = 0
-    /// 视频流意外断开后自动重连的次数（成功连上后归零）
-    private var retry = 0
-
-    init() {
-        let d = UserDefaults.standard
-        if let saved = d.object(forKey: "mirror.quality") as? Int {
-            quality = min(max(saved, 0), 2)
-        }
-        if let b = d.object(forKey: "mirror.bitrate") as? Double { bitrateMbps = min(max(b, 1), 16) }
-        if let f = d.object(forKey: "mirror.fps") as? Int { fps = f == 60 ? 60 : 30 }
-        turnScreenOff = d.bool(forKey: "mirror.offscreen")
-        scaleMode = (d.object(forKey: "mirror.scale") as? Int ?? 0) == 1 ? 1 : 0
-    }
 
     private let qualities: [(maxSize: Int, bitrate: Int)] = [
         (720, 2_000_000), (1280, 4_000_000), (1920, 8_000_000)
@@ -305,7 +283,17 @@ final class MirrorClient: ObservableObject {
             self?.status = "镜像中 \(w)×\(h)"
         }
         parser.onPacket = { [weak self] data, isConfig, pts in
-            if isConfig { self?.renderer.configure(data) } else { self?.renderer.enqueue(data, pts: pts) }
+            guard let self = self else { return }
+            if isConfig {
+                self.renderer.configure(data)
+                // 若服务端未发送 session 包，则用 SPS 解出的尺寸兜底，
+                // 保证触摸坐标映射可用。
+                if self.videoSize == .zero, self.renderer.videoSize != .zero {
+                    self.videoSize = self.renderer.videoSize
+                }
+            } else {
+                self.renderer.enqueue(data, pts: pts)
+            }
         }
         parser.onError = { [weak self] msg in self?.fail(msg) }
 
@@ -318,12 +306,9 @@ final class MirrorClient: ObservableObject {
         status = "启动服务端…"
         let scid = String(format: "%08x", UInt32.random(in: 1...0x7fff_ffff))
         let q = qualities[min(max(quality, 0), qualities.count - 1)]
-        let rate = Int(min(max(bitrateMbps, 1), 16) * 1_000_000)
-        let maxFps = fps == 60 ? 60 : 30
         let cmd = "CLASSPATH=\(remote) app_process / com.genymobile.scrcpy.Server 4.0"
             + " scid=\(scid) log_level=info audio=false tunnel_forward=true cleanup=false"
-            + " max_size=\(q.maxSize) video_bit_rate=\(rate) max_fps=\(maxFps)"
-            + (turnScreenOff ? " turn_screen_off=true" : "")
+            + " max_size=\(q.maxSize) video_bit_rate=\(q.bitrate) max_fps=30"
         server = await adb.open("shell:" + cmd, onData: { [weak self] d in
             self?.appendLog(d)
         }, onClose: { [weak self] in
@@ -358,7 +343,6 @@ final class MirrorClient: ObservableObject {
             guard alive(my) else { return }
         }
         if control == nil { status = "已连接视频，但控制通道失败（只能看，不能操作）" }
-        retry = 0
     }
 
     func stop() {
@@ -372,15 +356,6 @@ final class MirrorClient: ObservableObject {
     private func fail(_ msg: String) {
         teardown()
         status = msg
-        // 视频流掉线时自动重试一次；ADB 本身断开则不重试，交给 ADBClient 的重连
-        guard retry < 1, let a = adb, a.connected else { return }
-        retry += 1
-        status = msg + "，正在重连…"
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard let self = self, !self.running else { return }
-            await self.start(adb: a)
-        }
     }
 
     private func teardown() {
@@ -445,7 +420,8 @@ final class MirrorClient: ObservableObject {
         d.appendBE32(UInt32(max(0, min(y, h - 1))))
         d.appendBE16(UInt16(w))
         d.appendBE16(UInt16(h))
-        d.appendBE16(action == 1 ? 0 : 0xffff)
+        // pressure：scrcpy 对按下 / 移动 / 抬起都按 1.0（0xffff）处理更稳妥。
+        d.appendBE16(0xffff)
         d.appendBE32(0)
         d.appendBE32(0)
         send(d)
@@ -461,30 +437,28 @@ final class MirrorClient: ObservableObject {
         }
     }
 
-    // MARK: 扩展控制（对应甲壳虫“远程控制”里的旋屏、通知栏、熄屏、文字输入）
-
-    /// 旋转设备（控制消息 type 11，scrcpy 2.x 起支持）
-    func rotateDevice() { send(Data([11])) }
-
-    /// 展开通知栏 / 快捷设置面板（type 5 / 6）
-    func openNotificationPanel() { send(Data([5])) }
-    func openSettingsPanel() { send(Data([6])) }
-
-    /// 屏幕电源：mode 0 熄灭，1 正常（type 10 + mode）
-    func screenPower(_ on: Bool) {
-        var d = Data([10])
-        d.append(on ? 1 : 0)
-        send(d)
-    }
-
-    /// 文本注入：把一段文字直接打进设备当前焦点输入框（type 1 + UTF-8）
+    /// 键盘文本注入（scrcpy INJECT_TEXT，type 1）。
+    /// 服务端限制最多 300 字节，且必须在 UTF-8 字符边界截断。
     func injectText(_ text: String) {
-        let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return }
+        guard running, control != nil, !text.isEmpty else { return }
+        var clipped = ""
+        var bytes = 0
+        for ch in text {
+            let n = String(ch).utf8.count
+            if bytes + n > 300 { break }
+            clipped.append(ch)
+            bytes += n
+        }
+        let payload = Array(clipped.utf8)
         var d = Data([1])
-        d.append(contentsOf: Array(s.utf8))
+        d.appendBE32(UInt32(payload.count))
+        d.append(contentsOf: payload)
         send(d)
     }
 
-    func volume(up: Bool) { key(up ? 24 : 25) }
+    /// 旋转设备（scrcpy ROTATE_DEVICE，type 11，单字节）。
+    func rotate() {
+        guard running, control != nil else { return }
+        send(Data([11]))
+    }
 }
