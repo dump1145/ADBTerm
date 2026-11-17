@@ -36,44 +36,25 @@ private let quickGroups: [QuickGroup] = [
         ("列出 /sdcard", "ls -la /sdcard"),
         ("截图到 /sdcard/s.png", "screencap -p /sdcard/s.png"),
         ("磁盘用量", "df -h")
-    ]),
-    QuickGroup(title: "系统", icon: "gearshape", items: [
-        ("重启设备", "reboot"),
-        ("重启到 Fastboot", "reboot bootloader"),
-        ("重启到 Recovery", "reboot recovery"),
-        ("关机", "reboot -p"),
-        ("运行时长", "uptime"),
-        ("进程列表", "ps -A | head -n 20")
-    ]),
-    QuickGroup(title: "网络", icon: "wifi", items: [
-        ("IP 地址", "ip addr show wlan0 | grep inet"),
-        ("无线调试端口", "getprop service.adb.tcp.port"),
-        ("Wi-Fi 状态", "dumpsys wifi | grep -m1 mNetworkInfo"),
-        ("当前前台 App", "dumpsys activity activities | grep mResumedActivity")
     ])
 ]
-
-private enum HomeSheet: String, Identifiable {
-    case screen, process, settings
-    var id: String { rawValue }
-}
 
 struct ContentView: View {
     @StateObject private var adb = ADBClient()
     @StateObject private var store = DeviceStore()
     @StateObject private var mirror = MirrorClient()
+    @StateObject private var commands = CommandStore()
     @State private var editing: Device?
     @State private var input = ""
     @State private var history: [String] = []
     @State private var historyIndex: Int?
-    @State private var tab = -1
-    @State private var sheet: HomeSheet?
+    @State private var tab = 0
 
     var body: some View {
         NavigationSplitView {
             sidebar
         } detail: {
-            mainArea
+            terminal
         }
         .sheet(item: $editing) { dev in
             DeviceEditor(device: dev) { store.save($0) }
@@ -141,136 +122,42 @@ struct ContentView: View {
         return .gray
     }
 
-    private var mainArea: some View {
+    private var terminal: some View {
         VStack(spacing: 10) {
             statusBar
-            if tab < 0 {
-                dashboard
-            } else {
-                HStack(spacing: 8) {
-                    Button { tab = -1 } label: {
-                        Label("返回", systemImage: "chevron.left").font(.subheadline)
-                    }
-                    Text(sectionTitle).font(.headline).lineLimit(1)
-                    Spacer()
-                }
-                sectionContent
+            Picker("", selection: $tab) {
+                Text("终端").tag(0)
+                Text("Logcat").tag(1)
+                Text("工具").tag(2)
+                Text("应用").tag(3)
+                Text("文件").tag(4)
+                Text("镜像").tag(5)
+                Text("命令").tag(6)
+            }
+            .pickerStyle(.segmented)
+            switch tab {
+            case 1:
+                LogView(adb: adb)
+            case 2:
+                ToolsView(adb: adb)
+            case 3:
+                AppsView(adb: adb)
+            case 4:
+                FilesView(adb: adb)
+            case 5:
+                MirrorView(adb: adb, mirror: mirror)
+            case 6:
+                CommandsView(adb: adb, store: commands)
+            default:
+                outputView
+                quickBar
+                inputBar
             }
         }
         .padding(12)
         .background(Color(.systemGroupedBackground))
         .navigationTitle(store.selected?.title ?? "未选择设备")
         .navigationBarTitleDisplayMode(.inline)
-        .sheet(item: $sheet) { which in
-            switch which {
-            case .screen: ScreenToolsView(adb: adb)
-            case .process: ProcessView(adb: adb)
-            case .settings: SettingsView(adb: adb)
-            }
-        }
-    }
-
-    private var sectionTitle: String {
-        switch tab {
-        case 0: return "终端"
-        case 1: return "Logcat"
-        case 2: return "工具"
-        case 3: return "应用管理"
-        case 4: return "文件管理"
-        case 5: return "屏幕镜像"
-        default: return ""
-        }
-    }
-
-    @ViewBuilder
-    private var sectionContent: some View {
-        switch tab {
-        case 1:
-            LogView(adb: adb)
-        case 2:
-            ToolsView(adb: adb)
-        case 3:
-            AppsView(adb: adb)
-        case 4:
-            FilesView(adb: adb)
-        case 5:
-            MirrorView(adb: adb, mirror: mirror)
-        default:
-            outputView
-            quickBar
-            inputBar
-        }
-    }
-
-    // MARK: - 首页
-
-    private var dashboard: some View {
-        ScrollView {
-            VStack(spacing: 12) {
-                deviceCard
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
-                          spacing: 10) {
-                    tile("终端", "terminal") { tab = 0 }
-                    tile("文件管理", "folder") { tab = 4 }
-                    tile("应用管理", "square.grid.2x2") { tab = 3 }
-                    tile("屏幕", "rectangle.on.rectangle") { sheet = .screen }
-                    tile("进程", "list.bullet.rectangle") { sheet = .process }
-                    tile("Logcat", "text.alignleft") { tab = 1 }
-                    tile("镜像", "airplayvideo") { tab = 5 }
-                    tile("工具", "wrench.and.screwdriver") { tab = 2 }
-                    tile("设置", "gearshape") { sheet = .settings }
-                }
-            }
-        }
-        .task(id: adb.connected) { if adb.connected { await adb.refreshInfo() } }
-    }
-
-    private var deviceCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: "iphone").font(.title2).foregroundColor(.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(store.selected?.title ?? "未选择设备").font(.headline)
-                    Text(adb.connected ? "已连接 \(store.selected?.host ?? ""):\(store.selected?.port ?? "")" : "未连接")
-                        .font(.caption)
-                        .foregroundColor(adb.connected ? .green : .secondary)
-                }
-                Spacer()
-            }
-            if adb.deviceInfo.isEmpty {
-                Text(adb.connected ? "正在读取设备信息…" : "连接后可查看型号、系统版本、分辨率、电量等")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            } else {
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
-                          alignment: .leading, spacing: 8) {
-                    ForEach(Array(adb.deviceInfo.prefix(8).enumerated()), id: \.offset) { _, item in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.0).font(.caption2).foregroundColor(.secondary)
-                            Text(item.1).font(.caption).lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .background(Color(.secondarySystemGroupedBackground))
-        .cornerRadius(12)
-    }
-
-    private func tile(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 8) {
-                Image(systemName: icon).font(.title3)
-                Text(title).font(.caption)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
-            .background(Color(.secondarySystemGroupedBackground))
-            .cornerRadius(12)
-        }
-        .disabled(!adb.connected && title != "设置")
     }
 
     private var statusBar: some View {
@@ -407,9 +294,6 @@ struct DeviceEditor: View {
     @State var device: Device
     let onSave: (Device) -> Void
 
-    @StateObject private var discovery = ADBDiscovery()
-    @State private var scanning = false
-
     init(device: Device, onSave: @escaping (Device) -> Void) {
         _device = State(initialValue: device)
         self.onSave = onSave
@@ -429,17 +313,6 @@ struct DeviceEditor: View {
                     TextField("端口", text: $device.port)
                         .keyboardType(.numberPad)
                 }
-                Section {
-                    Button {
-                        scanning = true
-                        discovery.start()
-                    } label: {
-                        Label("扫描局域网内的设备", systemImage: "antenna.radiowaves.left.and.right")
-                    }
-                } footer: {
-                    Text("只对已开启无线调试的手机有效；扫描走 mDNS，需允许“本地网络”。")
-                        .font(.footnote)
-                }
             }
             .navigationTitle("设备")
             .navigationBarTitleDisplayMode(.inline)
@@ -455,15 +328,6 @@ struct DeviceEditor: View {
                     .disabled(device.host.trimmingCharacters(in: .whitespaces).isEmpty
                               || UInt16(device.port) == nil)
                 }
-            }
-            .sheet(isPresented: $scanning) {
-                DiscoverySheet(discovery: discovery) { found in
-                    device.host = found.host
-                    device.port = String(found.port)
-                    if device.name.isEmpty { device.name = found.name }
-                    scanning = false
-                }
-                .onDisappear { discovery.stop() }
             }
         }
     }

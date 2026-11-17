@@ -3,6 +3,7 @@ import SwiftUI
 private enum AppAction: String {
     case launch = "启动", stop = "强行停止", clear = "清除数据"
     case toggle = "禁用 / 启用", uninstall = "卸载", export = "导出 APK"
+    case permissions = "权限管理"
 }
 
 struct AppsView: View {
@@ -16,6 +17,7 @@ struct AppsView: View {
     @State private var pending: (AppInfo, AppAction)?
     @State private var showConfirm = false
     @State private var shareURL: URL?
+    @State private var permTarget: AppInfo?
 
     private var shown: [AppInfo] {
         apps.filter { a in
@@ -80,7 +82,11 @@ struct AppsView: View {
             Button("清除数据", role: .destructive) { ask(a, .clear) }
             Button(a.system ? "卸载（仅当前用户）" : "卸载", role: .destructive) { ask(a, .uninstall) }
             Button("导出 APK") { perform(a, .export) }
+            Button("权限管理") { permTarget = a }
             Button("取消", role: .cancel) {}
+        }
+        .sheet(item: $permTarget) { a in
+            PermissionsView(adb: adb, pkg: a.pkg)
         }
         .alert("确认\(pending?.1.rawValue ?? "")？", isPresented: $showConfirm) {
             Button("确认", role: .destructive) {
@@ -136,6 +142,8 @@ struct AppsView: View {
                 } else {
                     message = "导出失败"
                 }
+            case .permissions:
+                permTarget = a
             }
         }
     }

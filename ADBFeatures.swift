@@ -79,11 +79,16 @@ extension ADBClient {
             + "echo android=$(getprop ro.build.version.release);echo sdk=$(getprop ro.build.version.sdk);"
             + "echo abi=$(getprop ro.product.cpu.abi);echo size=$(wm size | tail -n1);"
             + "echo density=$(wm density | tail -n1);echo battery=$(dumpsys battery | grep -m1 level);"
-            + "echo mem=$(head -n1 /proc/meminfo);echo disk=$(df -h /data | tail -n1)"
+            + "echo charging=$(dumpsys battery | grep -m1 plugged);"
+            + "echo mem=$(head -n1 /proc/meminfo);echo disk=$(df -h /data | tail -n1);"
+            + "echo ip=$(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | head -n1);"
+            + "echo uptime=$(uptime 2>/dev/null | sed 's/.*up //' | cut -d, -f1);"
+            + "echo serial=$(getprop ro.serialno);echo device=$(getprop ro.product.device)"
         guard let d = await collect("shell:" + script) else { return }
         let names = ["brand": "品牌", "model": "型号", "android": "Android", "sdk": "SDK",
                      "abi": "CPU 架构", "size": "分辨率", "density": "屏幕密度",
-                     "battery": "电量", "mem": "内存", "disk": "存储"]
+                     "battery": "电量", "charging": "充电", "mem": "内存", "disk": "存储",
+                     "ip": "局域网 IP", "uptime": "已运行", "serial": "序列号", "device": "设备代号"]
         var items: [(String, String)] = []
         for line in String(decoding: d, as: UTF8.self).split(whereSeparator: \.isNewline) {
             guard let i = line.firstIndex(of: "=") else { continue }
@@ -187,33 +192,5 @@ extension ADBClient {
         }
         closeStream(s)
         return parser.done
-    }
-
-    /// sync STAT：取单个路径的属性（权限、大小、mtime），失败返回 nil。
-    func stat(_ remote: String) async -> FileEntry? {
-        let box = DataBox()
-        guard let s = await open("sync:", onData: { box.data.append($0) }) else { return nil }
-        let p = Data(remote.utf8)
-        var req = Data("STAT".utf8)
-        req.appendLE(UInt32(p.count))
-        req.append(p)
-        await s.write(req)
-        var waited = 0
-        while box.data.count < 16 && waited < 40 && !s.closed {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            waited += 1
-        }
-        closeStream(s)
-        guard box.data.count >= 16 else { return nil }
-        return FileEntry(name: (remote as NSString).lastPathComponent,
-                         mode: box.data.le32(4),
-                         size: box.data.le32(8),
-                         mtime: box.data.le32(12))
-    }
-
-    /// 重命名 / 移动（shell mv，带引号转义）
-    func rename(_ from: String, to: String) async -> Bool {
-        let out = await shellText("mv -f \(shq(from)) \(shq(to)) && echo OK")
-        return out.contains("OK")
     }
 }

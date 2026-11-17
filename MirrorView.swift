@@ -27,9 +27,7 @@ final class MirrorUIView: UIView {
     private func map(_ p: CGPoint) -> (Int, Int)? {
         guard let size = mirror?.videoSize, size.width > 0, size.height > 0,
               bounds.width > 0, bounds.height > 0 else { return nil }
-        let fit = min(bounds.width / size.width, bounds.height / size.height)
-        let fill = max(bounds.width / size.width, bounds.height / size.height)
-        let scale = (mirror?.scaleMode == 1) ? fill : fit
+        let scale = min(bounds.width / size.width, bounds.height / size.height)
         let vw = size.width * scale
         let vh = size.height * scale
         let ox = (bounds.width - vw) / 2
@@ -90,195 +88,180 @@ struct MirrorSurface: UIViewRepresentable {
     }
 }
 
-
 struct MirrorView: View {
     @ObservedObject var adb: ADBClient
     @ObservedObject var mirror: MirrorClient
-
     @State private var immersive = false
-    @State private var showOptions = false
-    @State private var textDraft = ""
+    @State private var showKeyboard = false
 
     var body: some View {
-        VStack(spacing: 8) {
-            if !immersive {
-                topBar
+        ZStack(alignment: .topTrailing) {
+            VStack(spacing: 8) {
+                if !immersive { controlBar }
+                MirrorSurface(mirror: mirror)
+                    .background(Color.black)
+                    .cornerRadius(immersive ? 0 : 12)
+                if !immersive { keyPads }
             }
-
-            MirrorSurface(mirror: mirror)
-                .background(Color.black)
-                .cornerRadius(immersive ? 0 : 12)
-                .overlay(alignment: .topTrailing) {
-                    if immersive {
-                        Button {
-                            immersive = false
-                        } label: {
-                            Image(systemName: "arrow.down.right.and.arrow.up.left")
-                                .padding(10)
-                                .background(.black.opacity(0.55))
-                                .foregroundColor(.white)
-                                .clipShape(Circle())
-                        }
-                        .padding(12)
-                    }
-                }
-
-            if !immersive {
-                controlBar
-                keyBar
-            }
-        }
-        .sheet(isPresented: $showOptions) {
-            optionsSheet
-        }
-    }
-
-    // MARK: - 顶部
-
-    private var topBar: some View {
-        HStack(spacing: 10) {
-            Button(mirror.running ? "停止" : "开始镜像") {
-                if mirror.running {
-                    mirror.stop()
-                } else {
-                    Task { await mirror.start(adb: adb) }
+            if immersive {
+                Button { immersive = false } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(8)
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .tint(mirror.running ? .red : .green)
-            .disabled(!adb.connected)
-
-            Text(mirror.status)
-                .font(.footnote)
-                .foregroundColor(.secondary)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
-                immersive = true
-            } label: {
-                Image(systemName: "arrow.up.left.and.arrow.down.right")
-            }
-            .disabled(!mirror.running)
-
-            Button {
-                showOptions = true
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-            }
         }
+        .sheet(isPresented: $showKeyboard) { MirrorKeyboardSheet(mirror: mirror) }
     }
 
-    // MARK: - 控制条
+    // MARK: 顶部控制栏
 
     private var controlBar: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button(mirror.running ? "停止" : "开始镜像") {
+                    if mirror.running {
+                        mirror.stop()
+                    } else {
+                        Task { await mirror.start(adb: adb) }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(mirror.running ? .red : .green)
+                .disabled(!adb.connected)
+
+                if mirror.running {
+                    Button("重启") {
+                        mirror.stop()
+                        Task { await mirror.start(adb: adb) }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!adb.connected)
+                }
+
+                Spacer()
+
+                Button { showKeyboard = true } label: {
+                    Image(systemName: "keyboard")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!mirror.running)
+
+                Button { immersive = true } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!mirror.running)
+            }
+            HStack(spacing: 10) {
+                Picker("清晰度", selection: $mirror.quality) {
+                    Text("流畅").tag(0)
+                    Text("标准").tag(1)
+                    Text("高清").tag(2)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 210)
+                Text(mirror.status)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color(.secondarySystemGroupedBackground))
+        .cornerRadius(12)
+    }
+
+    // MARK: 按键区
+
+    private var keyPads: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                chip("返回", "chevron.backward") { mirror.key(4) }
-                chip("主页", "circle") { mirror.key(3) }
-                chip("多任务", "square.on.square") { mirror.key(187) }
-                chip("电源", "power") { mirror.key(26) }
-                chip("旋转", "rotate.right") { mirror.rotateDevice() }
-                chip("通知栏", "bell") { mirror.openNotificationPanel() }
-                chip("快捷设置", "switch.2") { mirror.openSettingsPanel() }
-                chip(mirror.turnScreenOff ? "亮屏" : "熄屏", "moon") {
-                    mirror.turnScreenOff.toggle()
-                    mirror.screenPower(!mirror.turnScreenOff)
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    navButton("chevron.backward", "返回", 4)
+                    navButton("circle", "主页", 3)
+                    navButton("square.on.square", "多任务", 187)
+                    navButton("power", "电源", 26)
+                    navButton("line.3.horizontal", "菜单", 82)
+                }
+                HStack(spacing: 8) {
+                    navButton("speaker.slash", "静音", 164)
+                    navButton("speaker.wave.1", "音量-", 25)
+                    navButton("speaker.wave.3", "音量+", 24)
+                    navButton("magnifyingglass", "搜索", 84)
+                    navButton("delete.left", "删除", 67)
+                    Button { mirror.rotate() } label: {
+                        Label("旋转", systemImage: "rotate.right")
+                            .font(.subheadline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color(.secondarySystemGroupedBackground))
+                            .cornerRadius(10)
+                    }
+                    .disabled(!mirror.running)
                 }
             }
         }
-        .disabled(!mirror.running)
     }
 
-    private var keyBar: some View {
-        HStack(spacing: 8) {
-            chip("音量-", "speaker.minus") { mirror.volume(up: false) }
-            chip("音量+", "speaker.plus") { mirror.volume(up: true) }
-            Button {
-                showOptions = true
-            } label: {
-                Label("输入文字", systemImage: "keyboard")
-                    .font(.subheadline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 9)
-                    .background(Color(.secondarySystemGroupedBackground))
-                    .cornerRadius(10)
-            }
-        }
-        .disabled(!mirror.running)
-    }
-
-    private func chip(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    private func navButton(_ icon: String, _ title: String, _ code: UInt32) -> some View {
+        Button { mirror.key(code) } label: {
             Label(title, systemImage: icon)
                 .font(.subheadline)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
+                .frame(width: 78)
+                .padding(.vertical, 10)
                 .background(Color(.secondarySystemGroupedBackground))
                 .cornerRadius(10)
         }
+        .disabled(!mirror.running)
     }
+}
 
-    // MARK: - 选项
+/// 远控键盘输入：发送文字到手机当前焦点输入框。
+struct MirrorKeyboardSheet: View {
+    @ObservedObject var mirror: MirrorClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
 
-    private var optionsSheet: some View {
+    var body: some View {
         NavigationStack {
-            Form {
-                Section("画质") {
-                    HStack {
-                        Text("码率")
-                        Slider(value: $mirror.bitrateMbps, in: 1...16, step: 1)
-                        Text("\(Int(mirror.bitrateMbps)) Mbps")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .frame(width: 70, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("先在手机上点开要输入的输入框，再在这里输入并发送。单次最多 300 字节。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextEditor(text: $text)
+                    .font(.system(size: 16))
+                    .frame(minHeight: 120)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.3))
+                    )
+                HStack(spacing: 10) {
+                    Button("发送回车") {
+                        mirror.injectText(text)
+                        mirror.key(66)
+                        text = ""
                     }
-                    Picker("帧率", selection: $mirror.fps) {
-                        Text("30 fps").tag(30)
-                        Text("60 fps").tag(60)
+                    .buttonStyle(.bordered)
+                    Button("发送") {
+                        mirror.injectText(text)
+                        text = ""
                     }
-                    Picker("分辨率上限", selection: $mirror.quality) {
-                        Text("720p").tag(0)
-                        Text("1280p").tag(1)
-                        Text("1920p").tag(2)
-                    }
-                    Text("修改画质后需重新点“开始镜像”生效")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+                    .buttonStyle(.borderedProminent)
+                    Spacer()
                 }
-
-                Section("显示") {
-                    Picker("画面比例", selection: $mirror.scaleMode) {
-                        Text("等比完整").tag(0)
-                        Text("铺满裁切").tag(1)
-                    }
-                    .pickerStyle(.segmented)
-                    Toggle("镜像时让设备熄屏", isOn: $mirror.turnScreenOff)
-                    if mirror.running {
-                        Button(mirror.turnScreenOff ? "立即熄屏" : "立即亮屏") {
-                            mirror.screenPower(!mirror.turnScreenOff)
-                        }
-                    }
-                }
-
-                Section("输入文字") {
-                    TextField("要打进设备当前输入框的文字", text: $textDraft, axis: .vertical)
-                        .lineLimit(3...6)
-                    Button("发送到设备") {
-                        mirror.injectText(textDraft)
-                        textDraft = ""
-                    }
-                    .disabled(textDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                } footer: {
-                    Text("需设备已处于可输入状态（输入框已聚焦）；含中文时按 UTF-8 直接注入。")
-                        .font(.footnote)
-                }
+                .disabled(!mirror.running)
+                Spacer()
             }
-            .navigationTitle("镜像选项")
+            .padding(16)
+            .navigationTitle("键盘输入")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { showOptions = false }
+                    Button("完成") { dismiss() }
                 }
             }
         }

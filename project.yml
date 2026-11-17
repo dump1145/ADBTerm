@@ -17,10 +17,6 @@ targets:
         CFBundleDisplayName: ADBTerm
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: 需要访问局域网以连接 Android 设备的 ADB。
-        NSBonjourServices:
-          - _adb._tcp
-          - _adb-tls-connect._tcp
-          - _adb-tls-pairing._tcp
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
@@ -29,6 +25,6 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.adbterm
         SWIFT_VERSION: "5.0"
-        MARKETING_VERSION: "0.9"
-        CURRENT_PROJECT_VERSION: "9"
+        MARKETING_VERSION: "0.7"
+        CURRENT_PROJECT_VERSION: "7"
         TARGETED_DEVICE_FAMILY: "1,2"
